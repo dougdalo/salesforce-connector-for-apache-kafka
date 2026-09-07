@@ -1,3 +1,31 @@
+## v0.4.0
+### What is changed
+ 
+
+ - Bump org.apache.maven:apache-maven from 3.9.11 to 3.9.16 (#95)
+ - Bump org.checkerframework:checker-qual from 4.2.1 to 4.2.2 (#93)
+ - Bump tools.jackson.core:jackson-databind from 3.2.1 to 3.2.2 (#94)
+ - Bump slf4j.version from 1.7.26 to 2.0.18 (#85)
+ - Bump io.aiven.commons:aiven-commons from 3 to 4 (#86)
+ - Bump org.checkerframework:checker-qual from 3.37.0 to 4.2.1 (#92)
+ - Bump tools.jackson.core:jackson-databind from 3.1.3 to 3.2.1 (#90)
+ - Aindriu aiven/update for json converter (#67)
+ - Bump org.apache.maven.plugins:maven-enforcer-plugin from 3.6.2 to 3.6.3 (#87)
+ - Bump io.aiven.commons:common-util from 0.1.0 to 0.2.0 (#83)
+ - Validate versions in the release preparation (#82)
+
+ 
+ 
+### Co-authored by
+ 
+ - Aindriú Lavelle
+ - Ryan Skraba
+ - Claude Warren
+ 
+ 
+### Full Changelog
+https://github.com/Aiven-Open/salesforce-connector-for-apache-kafka/compare/v0.3.0...v0.4.0
+ 
 ## v0.3.0
 ### What is changed
  
