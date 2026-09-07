@@ -1,3 +1,41 @@
+## v0.5.0
+### What is changed
+ 
+ - Changelog for v0.3.0 to v0.4.0
+ - Merge pull request #95 from Aiven-Open/dependabot/maven/org.apache.maven-apache-maven-3.9.16
+ - Bump org.apache.maven:apache-maven from 3.9.11 to 3.9.16
+ - Merge pull request #93 from Aiven-Open/dependabot/maven/org.checkerframework-checker-qual-4.2.2
+ - Bump org.checkerframework:checker-qual from 4.2.1 to 4.2.2
+ - Merge pull request #94 from Aiven-Open/dependabot/maven/tools.jackson.core-jackson-databind-3.2.2
+ - Bump tools.jackson.core:jackson-databind from 3.2.1 to 3.2.2
+ - Merge pull request #85 from Aiven-Open/dependabot/maven/slf4j.version-2.0.18
+ - Bump slf4j.version from 1.7.26 to 2.0.18
+ - Merge pull request #86 from Aiven-Open/dependabot/maven/io.aiven.commons-aiven-commons-4
+ - Bump io.aiven.commons:aiven-commons from 3 to 4
+ - Merge pull request #92 from Aiven-Open/dependabot/maven/org.checkerframework-checker-qual-4.2.1
+ - Bump org.checkerframework:checker-qual from 3.37.0 to 4.2.1
+ - Merge pull request #90 from Aiven-Open/dependabot/maven/tools.jackson.core-jackson-databind-3.2.0
+ - Bump tools.jackson.core:jackson-databind from 3.1.3 to 3.2.1
+ - Aindriu aiven/update for json converter (#67)
+ - Bump org.apache.maven.plugins:maven-enforcer-plugin from 3.6.2 to 3.6.3 (#87)
+ - Bump io.aiven.commons:common-util from 0.1.0 to 0.2.0 (#83)
+ - Validate versions in the release preparation (#82)
+ - Merge pull request #80 from Aiven-Open/release-0.3.0
+ - Bump version to 0.4.0-SNAPSHOT
+ 
+ 
+### Co-authored by
+ 
+ - Aindriu Lavelle
+ - Aindriú Lavelle
+ - dependabot[bot]
+ - github-actions[bot]
+ - Ryan Skraba
+ 
+ 
+### Full Changelog
+https://github.com/Aiven-Open/salesforce-connector-for-apache-kafka/compare/v0.3.0...v0.5.0
+ 
 ## v0.4.0
 ### What is changed
  
