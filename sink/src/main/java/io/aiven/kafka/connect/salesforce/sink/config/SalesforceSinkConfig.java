@@ -102,4 +102,32 @@ public final class SalesforceSinkConfig extends ConnectorCommonConfig
   public String getSinkObject() {
     return sinkFragment.getSinkObject();
   }
+
+  /**
+   * Gets the Bulk API 2.0 operation used when writing to Salesforce.
+   *
+   * @return one of "insert", "upsert", or "delete".
+   */
+  public String getOperation() {
+    return sinkFragment.getOperation();
+  }
+
+  /**
+   * Gets the Salesforce external ID field API name used to match records for upsert.
+   *
+   * @return the external ID field name, or an empty string when not configured.
+   */
+  public String getExternalIdField() {
+    return sinkFragment.getExternalIdField();
+  }
+
+  /**
+   * Gets the name of the record value field used to determine each record's operation on a
+   * per-record basis.
+   *
+   * @return the field name, or an empty string when per-record operation routing is disabled.
+   */
+  public String getRecordOperationField() {
+    return sinkFragment.getRecordOperationField();
+  }
 }

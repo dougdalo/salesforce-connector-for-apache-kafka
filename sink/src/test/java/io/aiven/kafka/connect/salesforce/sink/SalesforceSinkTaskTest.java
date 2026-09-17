@@ -22,7 +22,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -32,14 +34,17 @@ import io.aiven.kafka.connect.salesforce.common.bulk.query.JobState;
 import io.aiven.kafka.connect.salesforce.common.bulk.query.QueryResponse;
 import io.aiven.kafka.connect.salesforce.common.exceptions.SFAuthException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.junit.jupiter.api.Test;
@@ -106,7 +111,7 @@ public final class SalesforceSinkTaskTest {
       qr.setId("<JOB_ID>");
       qr.setState(multipartIngestState);
       if (multipartIngestState == JobState.Failed) qr.setErrorMessage("<ERROR_MSG>");
-      when(api.multipartInsert(any(), any(), any()))
+      when(api.multipartInsert(any(), any(), any(), any(), any()))
           .thenAnswer(
               invocation -> {
                 // We need to capture the stream here or it gets consumed by Mockito
@@ -178,7 +183,9 @@ public final class SalesforceSinkTaskTest {
         .multipartInsert(
             eq("Account"),
             eq(new Object[] {"AccountNumber", "Name", "NumberofLocations__c", "Rating"}),
-            any());
+            any(),
+            eq(BulkApiClient.INSERT_OPERATION),
+            eq(""));
     verify(api, times(1)).waitForJob(any(), anyString());
 
     assertThat(capturedData)
@@ -232,6 +239,240 @@ public final class SalesforceSinkTaskTest {
     task.stop();
   }
 
+  /**
+   * Tests the delete path: only the "Id" field is extracted from each record and sent as a
+   * single-column CSV, and records missing "Id" are skipped and reported via the errant record
+   * reporter instead of failing the whole batch.
+   */
+  @Test
+  void testDeleteOperation() {
+    var capturedData = new ArrayList<Object[]>();
+    var api = createApiMock(JobState.JobComplete, capturedData);
+
+    var task = new SalesforceSinkTask(api);
+    var context = Mockito.mock(SinkTaskContext.class);
+    var errantRecordReporter = Mockito.mock(ErrantRecordReporter.class);
+    when(context.errantRecordReporter()).thenReturn(errantRecordReporter);
+    task.initialize(context);
+
+    var config = new HashMap<>(createTestConfig());
+    config.put("salesforce.bulk.api.sink.operation", "delete");
+    task.start(config);
+
+    // A well-formed record with an Id, ready to be deleted; other fields are ignored.
+    task.put(List.of(createStructRecord("Id", "001xx000003DGb2AAG", "Name", "Test1")));
+    // A record missing the Id field entirely; should be skipped and reported, not fail the batch.
+    task.put(List.of(createStructRecord("Name", "Test2")));
+
+    task.flush(Map.of());
+    task.stop();
+
+    verify(api, times(1))
+        .multipartInsert(
+            eq("Account"),
+            eq(new Object[] {"Id"}),
+            any(),
+            eq(BulkApiClient.DELETE_OPERATION),
+            isNull());
+    verify(api, times(1)).waitForJob(any(), anyString());
+    verify(errantRecordReporter, times(1)).report(any(), any());
+
+    assertThat(capturedData).containsExactly(new Object[] {"001xx000003DGb2AAG"});
+  }
+
+  /**
+   * Tests per-record operation routing: when {@code
+   * salesforce.bulk.api.sink.record.operation.field} is set, records in the same flush can resolve
+   * to different operations (here insert and delete), each submitted as its own Bulk API 2.0 job;
+   * records without the field fall back to the connector's configured default operation (insert).
+   */
+  @Test
+  void testPerRecordOperationRouting() throws SFAuthException {
+    var api = Mockito.mock(BulkApiClient.class);
+    var capturedOperations = new ArrayList<String>();
+    var capturedRows = new ArrayList<List<Object[]>>();
+    doNothing().when(api).authenticate();
+    var qr = new QueryResponse();
+    qr.setId("<JOB_ID>");
+    qr.setState(JobState.JobComplete);
+    when(api.multipartInsert(any(), any(), any(), any(), any()))
+        .thenAnswer(
+            invocation -> {
+              String operation = invocation.getArgument(3);
+              Stream<Object[]> dataStream = invocation.getArgument(2);
+              List<Object[]> rows = new ArrayList<>();
+              dataStream.forEach(rows::add);
+              capturedOperations.add(operation);
+              capturedRows.add(rows);
+              return Optional.of(qr);
+            });
+    when(api.waitForJob(any(), anyString())).thenReturn(qr);
+
+    var task = new SalesforceSinkTask(api);
+    var context = Mockito.mock(SinkTaskContext.class);
+    var errantRecordReporter = Mockito.mock(ErrantRecordReporter.class);
+    when(context.errantRecordReporter()).thenReturn(errantRecordReporter);
+    task.initialize(context);
+
+    var config = new HashMap<>(createTestConfig());
+    config.put("salesforce.bulk.api.sink.record.operation.field", "_operation");
+    task.start(config);
+
+    task.put(
+        List.of(
+            createStructRecord("_operation", "insert", "Name", "Test1"),
+            // No "_operation" field: falls back to the default operation (insert).
+            createStructRecord("Name", "Test2"),
+            createStructRecord("_operation", "delete", "Id", "001xx000003DGb2AAG")));
+
+    task.flush(Map.of());
+    task.stop();
+
+    assertThat(capturedOperations)
+        .containsExactlyInAnyOrder(BulkApiClient.INSERT_OPERATION, BulkApiClient.DELETE_OPERATION);
+    int insertIndex = capturedOperations.indexOf(BulkApiClient.INSERT_OPERATION);
+    int deleteIndex = capturedOperations.indexOf(BulkApiClient.DELETE_OPERATION);
+    assertThat(capturedRows.get(insertIndex))
+        .containsExactlyInAnyOrder(new Object[] {"Test1"}, new Object[] {"Test2"});
+    assertThat(capturedRows.get(deleteIndex)).containsExactly(new Object[] {"001xx000003DGb2AAG"});
+    verify(api, times(2)).waitForJob(any(), anyString());
+    verify(errantRecordReporter, never()).report(any(), any());
+  }
+
+  /**
+   * Tests that a record whose per-record operation field carries an unrecognized value is skipped
+   * and reported via the errant record reporter, without failing the rest of the batch.
+   */
+  @Test
+  void testPerRecordOperationInvalidValueIsSkipped() {
+    var capturedData = new ArrayList<Object[]>();
+    var api = createApiMock(JobState.JobComplete, capturedData);
+
+    var task = new SalesforceSinkTask(api);
+    var context = Mockito.mock(SinkTaskContext.class);
+    var errantRecordReporter = Mockito.mock(ErrantRecordReporter.class);
+    when(context.errantRecordReporter()).thenReturn(errantRecordReporter);
+    task.initialize(context);
+
+    var config = new HashMap<>(createTestConfig());
+    config.put("salesforce.bulk.api.sink.record.operation.field", "_operation");
+    task.start(config);
+
+    task.put(
+        List.of(
+            createStructRecord("_operation", "not-a-real-operation", "Name", "Bad"),
+            createStructRecord("_operation", "insert", "Name", "Good")));
+
+    task.flush(Map.of());
+    task.stop();
+
+    verify(errantRecordReporter, times(1)).report(any(), any());
+    assertThat(capturedData).containsExactly(new Object[] {"Good"});
+  }
+
+  /**
+   * Tests that a record resolving to "upsert" is skipped and reported when no external ID field is
+   * configured, since Salesforce upsert requires one, while other records in the batch still go
+   * through.
+   */
+  @Test
+  void testPerRecordUpsertWithoutExternalIdIsSkipped() {
+    var capturedData = new ArrayList<Object[]>();
+    var api = createApiMock(JobState.JobComplete, capturedData);
+
+    var task = new SalesforceSinkTask(api);
+    var context = Mockito.mock(SinkTaskContext.class);
+    var errantRecordReporter = Mockito.mock(ErrantRecordReporter.class);
+    when(context.errantRecordReporter()).thenReturn(errantRecordReporter);
+    task.initialize(context);
+
+    var config = new HashMap<>(createTestConfig());
+    config.put("salesforce.bulk.api.sink.record.operation.field", "_operation");
+    task.start(config);
+
+    task.put(
+        List.of(
+            createStructRecord("_operation", "upsert", "Name", "NoExternalId"),
+            createStructRecord("_operation", "insert", "Name", "Good")));
+
+    task.flush(Map.of());
+    task.stop();
+
+    verify(errantRecordReporter, times(1)).report(any(), any());
+    assertThat(capturedData).containsExactly(new Object[] {"Good"});
+  }
+
+  /**
+   * Tests delete-by-external-ID: when {@code salesforce.bulk.api.sink.external.id.field} is
+   * configured, delete records carry that external ID field instead of the Salesforce {@code Id};
+   * the task resolves it via {@link BulkApiClient#resolveIdsByExternalId} before submitting the
+   * delete job, and a record whose external ID doesn't resolve to any Salesforce record is skipped
+   * and reported instead of failing the batch.
+   */
+  @Test
+  void testDeleteByExternalId() {
+    var capturedData = new ArrayList<Object[]>();
+    var api = createApiMock(JobState.JobComplete, capturedData);
+    when(api.resolveIdsByExternalId(eq("Account"), eq("ExternalId__c"), any()))
+        .thenReturn(Optional.of(Map.of("ext-1", "001xx000003DGb2AAG")));
+
+    var task = new SalesforceSinkTask(api);
+    var context = Mockito.mock(SinkTaskContext.class);
+    var errantRecordReporter = Mockito.mock(ErrantRecordReporter.class);
+    when(context.errantRecordReporter()).thenReturn(errantRecordReporter);
+    task.initialize(context);
+
+    var config = new HashMap<>(createTestConfig());
+    config.put("salesforce.bulk.api.sink.operation", "delete");
+    config.put("salesforce.bulk.api.sink.external.id.field", "ExternalId__c");
+    task.start(config);
+
+    // Resolves to a real Salesforce Id via the mocked lookup.
+    task.put(List.of(createStructRecord("ExternalId__c", "ext-1")));
+    // No matching Salesforce record for this external Id: skipped and reported.
+    task.put(List.of(createStructRecord("ExternalId__c", "ext-unknown")));
+
+    task.flush(Map.of());
+    task.stop();
+
+    verify(api, times(1))
+        .multipartInsert(
+            eq("Account"),
+            eq(new Object[] {"Id"}),
+            any(),
+            eq(BulkApiClient.DELETE_OPERATION),
+            isNull());
+    verify(api, times(1)).waitForJob(any(), anyString());
+    verify(errantRecordReporter, times(1)).report(any(), any());
+    assertThat(capturedData).containsExactly(new Object[] {"001xx000003DGb2AAG"});
+  }
+
+  /**
+   * Tests that a failed external ID resolution (the SOQL lookup query itself failing) fails the
+   * whole flush with a {@link ConnectException}, rather than silently dropping the records.
+   */
+  @Test
+  void testDeleteByExternalIdResolutionFailureThrows() {
+    var api = createApiMock(JobState.JobComplete, new ArrayList<>());
+    when(api.resolveIdsByExternalId(eq("Account"), eq("ExternalId__c"), any()))
+        .thenReturn(Optional.empty());
+
+    var task = new SalesforceSinkTask(api);
+    task.initialize(Mockito.mock(SinkTaskContext.class));
+
+    var config = new HashMap<>(createTestConfig());
+    config.put("salesforce.bulk.api.sink.operation", "delete");
+    config.put("salesforce.bulk.api.sink.external.id.field", "ExternalId__c");
+    task.start(config);
+
+    task.put(List.of(createStructRecord("ExternalId__c", "ext-1")));
+
+    assertThatThrownBy(() -> task.flush(Map.of()))
+        .isInstanceOf(ConnectException.class)
+        .hasMessageContaining("Unable to resolve Salesforce record Ids");
+    task.stop();
+  }
+
   /** Tests the timeout scenario where a job doesn't complete within the timeout period. */
   @Test
   void testJobTimeout() {
@@ -246,6 +487,64 @@ public final class SalesforceSinkTaskTest {
         .hasMessage(
             "Salesforce bulk ingest job <JOB_ID> timed out while still in state: InProgress");
     task.stop();
+  }
+
+  /**
+   * Tests that a failed flush doesn't leave its records in the internal buffer: Kafka Connect is
+   * the sole retry mechanism for a failed flush (it re-delivers the same records via a future
+   * {@link SalesforceSinkTask#put} once it seeks the consumer back after not committing offsets),
+   * so if the connector also retained them internally, the redelivered copies would pile up on top
+   * of the retained ones and the buffer would grow without bound across repeated failures. This
+   * simulates that redelivery directly: {@code put()} the same logical record twice, with a failed
+   * flush in between, and confirms the second flush only ever sees one record, not two.
+   */
+  @Test
+  void testBufferNotDuplicatedAfterFailedFlush() throws SFAuthException {
+    var api = Mockito.mock(BulkApiClient.class);
+    var capturedRowCounts = new ArrayList<Integer>();
+    var flushAttempt = new AtomicInteger(0);
+    doNothing().when(api).authenticate();
+
+    var submittedResponse = new QueryResponse();
+    submittedResponse.setId("<JOB_ID>");
+    submittedResponse.setState(JobState.UploadComplete);
+
+    when(api.multipartInsert(any(), any(), any(), any(), any()))
+        .thenAnswer(
+            invocation -> {
+              Stream<Object[]> dataStream = invocation.getArgument(2);
+              capturedRowCounts.add((int) dataStream.count());
+              return Optional.of(submittedResponse);
+            });
+    when(api.waitForJob(any(), anyString()))
+        .thenAnswer(
+            invocation -> {
+              var qr = new QueryResponse();
+              qr.setId("<JOB_ID>");
+              if (flushAttempt.getAndIncrement() == 0) {
+                qr.setState(JobState.Failed);
+                qr.setErrorMessage("<ERROR_MSG>");
+              } else {
+                qr.setState(JobState.JobComplete);
+              }
+              return qr;
+            });
+
+    var task = new SalesforceSinkTask(api);
+    task.initialize(Mockito.mock(SinkTaskContext.class));
+    task.start(createTestConfig());
+
+    // First attempt: fails at the Salesforce job level, after the record was already buffered.
+    task.put(List.of(createStructRecord("Name", "Test1")));
+    assertThatThrownBy(() -> task.flush(Map.of())).isInstanceOf(ConnectException.class);
+
+    // Kafka Connect didn't commit the offset, so it redelivers the same record via a new put().
+    task.put(List.of(createStructRecord("Name", "Test1")));
+    task.flush(Map.of());
+    task.stop();
+
+    // If the failed record had stayed in the buffer, this second flush would have seen 2 rows.
+    assertThat(capturedRowCounts).containsExactly(1, 1);
   }
 
   /**

@@ -43,6 +43,7 @@ import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -154,7 +155,9 @@ public class BulkApiClientTest {
         apiClient.multipartInsert(
             "Account",
             new String[] {"AccountNumber", "Name"},
-            Stream.of(new Object[] {"1", "Test1"}, new Object[] {"2", "Test2, Inc"}));
+            Stream.of(new Object[] {"1", "Test1"}, new Object[] {"2", "Test2, Inc"}),
+            BulkApiClient.INSERT_OPERATION,
+            null);
 
     // Testing the parsed response
     assertThat(result)
@@ -202,6 +205,133 @@ public class BulkApiClientTest {
             AccountNumber,Name
             1,Test1
             2,"Test2, Inc"
+            --%1$s--
+            """,
+                reqContentType[1]));
+  }
+
+  /** Tests that an upsert job is submitted with the operation and externalIdFieldName set. */
+  @Test
+  public void testMultipartUpsert() {
+    apiClient = createClient();
+    when(login.getAccessToken(eq(TEST_CLIENT_ID), eq(TEST_CLIENT_SECRET))).thenReturn(BEARER_TOKEN);
+
+    String responseBody =
+        """
+            { "id":"000UPSERTID000",
+              "object":"Account",
+              "operation": "upsert" }
+            """;
+
+    HttpResponse<Object> mockQueryResponse = mockResponse(responseBody, HttpStatus.SC_OK);
+
+    when(client.sendAsync(any(HttpRequest.class), any()))
+        .thenReturn(CompletableFuture.completedFuture(mockQueryResponse));
+
+    Optional<QueryResponse> result =
+        apiClient.multipartInsert(
+            "Account",
+            new String[] {"ExternalId__c", "Name"},
+            Stream.<Object[]>of(new Object[] {"ext-1", "Test1"}),
+            BulkApiClient.UPSERT_OPERATION,
+            "ExternalId__c");
+
+    assertThat(result)
+        .hasValueSatisfying(
+            response -> {
+              assertThat(response).hasFieldOrPropertyWithValue("id", "000UPSERTID000");
+              assertThat(response).hasFieldOrPropertyWithValue("object", "Account");
+            });
+
+    ArgumentCaptor<HttpRequest> captor = ArgumentCaptor.forClass(HttpRequest.class);
+    verify(client).sendAsync(captor.capture(), any());
+
+    String[] reqContentType =
+        captor.getValue().headers().firstValue("Content-Type").orElseThrow().split("\"", -1);
+    assertThat(reqContentType).hasSize(3);
+
+    String body = extractMockBody(captor.getValue().bodyPublisher().orElseThrow());
+    assertThat(body)
+        .isEqualTo(
+            String.format(
+                """
+            --%1$s
+            Content-Type: application/json
+            Content-Disposition: form-data; name="job"
+
+            {"object":"Account","contentType":"CSV","operation":"upsert","lineEnding":"LF","externalIdFieldName":"ExternalId__c"}
+
+            --%1$s
+            Content-Type: text/csv
+            Content-Disposition: form-data; name="content"; filename="content"
+
+            ExternalId__c,Name
+            ext-1,Test1
+            --%1$s--
+            """,
+                reqContentType[1]));
+  }
+
+  /**
+   * Tests that a delete job is submitted with only the operation set (no externalIdFieldName) and a
+   * single-column "Id" CSV body.
+   */
+  @Test
+  public void testMultipartDeleteOperation() {
+    apiClient = createClient();
+    when(login.getAccessToken(eq(TEST_CLIENT_ID), eq(TEST_CLIENT_SECRET))).thenReturn(BEARER_TOKEN);
+
+    String responseBody =
+        """
+            { "id":"000DELETEID000",
+              "object":"Account",
+              "operation": "delete" }
+            """;
+
+    HttpResponse<Object> mockQueryResponse = mockResponse(responseBody, HttpStatus.SC_OK);
+
+    when(client.sendAsync(any(HttpRequest.class), any()))
+        .thenReturn(CompletableFuture.completedFuture(mockQueryResponse));
+
+    Optional<QueryResponse> result =
+        apiClient.multipartInsert(
+            "Account",
+            new String[] {"Id"},
+            Stream.<Object[]>of(new Object[] {"001xx000003DGb2AAG"}),
+            BulkApiClient.DELETE_OPERATION,
+            null);
+
+    assertThat(result)
+        .hasValueSatisfying(
+            response -> {
+              assertThat(response).hasFieldOrPropertyWithValue("id", "000DELETEID000");
+              assertThat(response).hasFieldOrPropertyWithValue("object", "Account");
+            });
+
+    ArgumentCaptor<HttpRequest> captor = ArgumentCaptor.forClass(HttpRequest.class);
+    verify(client).sendAsync(captor.capture(), any());
+
+    String[] reqContentType =
+        captor.getValue().headers().firstValue("Content-Type").orElseThrow().split("\"", -1);
+    assertThat(reqContentType).hasSize(3);
+
+    String body = extractMockBody(captor.getValue().bodyPublisher().orElseThrow());
+    assertThat(body)
+        .isEqualTo(
+            String.format(
+                """
+            --%1$s
+            Content-Type: application/json
+            Content-Disposition: form-data; name="job"
+
+            {"object":"Account","contentType":"CSV","operation":"delete","lineEnding":"LF"}
+
+            --%1$s
+            Content-Type: text/csv
+            Content-Disposition: form-data; name="content"; filename="content"
+
+            Id
+            001xx000003DGb2AAG
             --%1$s--
             """,
                 reqContentType[1]));
@@ -544,6 +674,57 @@ public class BulkApiClientTest {
 
     // Should have made all 6 attempts
     verify(client, times(6)).sendAsync(any(HttpRequest.class), any());
+  }
+
+  /**
+   * Tests the happy path of resolving external ID values to Salesforce record Ids: values with a
+   * matching record resolve, values with no matching record are simply absent from the result.
+   */
+  @Test
+  public void testResolveIdsByExternalIdHappyPath() throws JsonProcessingException {
+    apiClient = createClient();
+    when(login.getAccessToken(eq(TEST_CLIENT_ID), eq(TEST_CLIENT_SECRET))).thenReturn(BEARER_TOKEN);
+
+    String responseBody =
+        """
+            { "totalSize": 2, "done": true, "records": [
+              {"Id": "001AAAAAAAAAAAAAAA", "ExternalId__c": "ext-1"},
+              {"Id": "001BBBBBBBBBBBBBBB", "ExternalId__c": "ext-2"}
+            ] }
+            """;
+    HttpResponse<Object> mockQueryResponse = mockResponse(responseBody, 200);
+    when(client.sendAsync(any(HttpRequest.class), any()))
+        .thenReturn(CompletableFuture.completedFuture(mockQueryResponse));
+
+    Optional<Map<String, String>> result =
+        apiClient.resolveIdsByExternalId(
+            "Account", "ExternalId__c", List.of("ext-1", "ext-2", "ext-missing"));
+
+    assertThat(result).isPresent();
+    assertThat(result.get())
+        .containsExactlyInAnyOrderEntriesOf(
+            Map.of(
+                "ext-1", "001AAAAAAAAAAAAAAA",
+                "ext-2", "001BBBBBBBBBBBBBBB"));
+    assertThat(result.get()).doesNotContainKey("ext-missing");
+  }
+
+  /** Tests that a failed query (non-2xx response) resolves to {@link Optional#empty()}. */
+  @Test
+  public void testResolveIdsByExternalIdQueryFailure() {
+    apiClient = createClient();
+    when(login.getAccessToken(eq(TEST_CLIENT_ID), eq(TEST_CLIENT_SECRET))).thenReturn(BEARER_TOKEN);
+
+    HttpResponse<Object> mockFailureResponse = mockResponse("", 500);
+    when(mockFailureResponse.request())
+        .thenReturn(HttpRequest.newBuilder(URI.create(TEST_SALESFORCE_URI)).build());
+    when(client.sendAsync(any(HttpRequest.class), any()))
+        .thenReturn(CompletableFuture.completedFuture(mockFailureResponse));
+
+    Optional<Map<String, String>> result =
+        apiClient.resolveIdsByExternalId("Account", "ExternalId__c", List.of("ext-1"));
+
+    assertThat(result).isEmpty();
   }
 
   private HttpResponse<Object> mockResponse(String payload, int statusCode) {

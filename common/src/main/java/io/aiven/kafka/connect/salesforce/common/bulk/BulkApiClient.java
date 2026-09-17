@@ -16,6 +16,7 @@
 package io.aiven.kafka.connect.salesforce.common.bulk;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.aiven.commons.kafka.connector.common.NativeInfo;
 import io.aiven.commons.util.strings.HttpStatus;
@@ -38,17 +39,23 @@ import io.aiven.kafka.connect.salesforce.common.exceptions.SFAuthException;
 import io.aiven.kafka.connect.salesforce.common.exceptions.SFForbiddenException;
 import io.aiven.kafka.connect.salesforce.common.exceptions.SFRetryException;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.lang3.StringUtils;
@@ -72,6 +79,21 @@ public class BulkApiClient {
    */
   public static final String QUERY_OPERATION = "query";
 
+  /** Bulk API 2.0 ingest operation that always creates new records. */
+  public static final String INSERT_OPERATION = "insert";
+
+  /**
+   * Bulk API 2.0 ingest operation that creates or updates records, matched by an external ID field.
+   * Requires {@code externalIdFieldName} to be supplied to {@link #multipartInsert}.
+   */
+  public static final String UPSERT_OPERATION = "upsert";
+
+  /**
+   * Bulk API 2.0 ingest operation that soft-deletes records (moved to the Recycle Bin) identified
+   * by their Salesforce record Id.
+   */
+  public static final String DELETE_OPERATION = "delete";
+
   /** Authentication Bearer token identifier to be used with the access_token in http requests */
   public static final String BEARER = "Bearer ";
 
@@ -92,6 +114,12 @@ public class BulkApiClient {
 
   /** This is the header that tells you the current state of the api limit */
   private static final String SFORCE_LIMIT_INFO = "Sforce-Limit-Info";
+
+  /**
+   * This is the URI endpoint which when added to the salesforce uri is used to run a synchronous
+   * SOQL query via the REST API (distinct from the async Bulk API 2.0 query job above).
+   */
+  protected static final String simpleQueryUri = "/services/data/%s/query";
 
   /** The Http client that is used to make http requests to Salesforce */
   private final HttpClient client;
@@ -213,6 +241,107 @@ public class BulkApiClient {
   }
 
   /**
+   * Resolves Salesforce record Ids for a set of external ID field values via synchronous SOQL
+   * queries against the REST API, chunking the lookup to stay within Salesforce's query length
+   * limits. Used to translate a producer-supplied external ID (e.g. the same one used for upsert)
+   * into the Salesforce record Id required by a Bulk API 2.0 delete job, so callers never need to
+   * know Salesforce-generated Ids.
+   *
+   * @param object the Salesforce object to query
+   * @param externalIdField the external ID field API name
+   * @param externalIdValues the external ID values to resolve
+   * @return a map from external ID value to the matching Salesforce record Id; a value with no
+   *     matching record is simply absent from the map. {@link Optional#empty()} if the query itself
+   *     failed (as opposed to some values simply not matching any record).
+   */
+  public Optional<Map<String, String>> resolveIdsByExternalId(
+      String object, String externalIdField, Collection<String> externalIdValues) {
+    Map<String, String> resolved = new HashMap<>();
+    List<String> distinctValues = externalIdValues.stream().distinct().toList();
+    final int chunkSize = 200;
+    for (int start = 0; start < distinctValues.size(); start += chunkSize) {
+      List<String> chunk =
+          distinctValues.subList(start, Math.min(start + chunkSize, distinctValues.size()));
+      Optional<Map<String, String>> chunkResult =
+          queryExternalIdChunk(object, externalIdField, chunk);
+      if (chunkResult.isEmpty()) {
+        return Optional.empty();
+      }
+      resolved.putAll(chunkResult.get());
+    }
+    return Optional.of(resolved);
+  }
+
+  /**
+   * Runs a single SOQL {@code SELECT Id, <field> FROM <object> WHERE <field> IN (...)} query,
+   * following {@code nextRecordsUrl} pagination until exhausted.
+   *
+   * @param object the Salesforce object to query
+   * @param externalIdField the external ID field API name
+   * @param values the external ID values for this chunk (already within query length limits)
+   * @return a map from external ID value to Salesforce record Id for matches found in this chunk;
+   *     {@link Optional#empty()} if the query failed
+   */
+  private Optional<Map<String, String>> queryExternalIdChunk(
+      String object, String externalIdField, List<String> values) {
+    Map<String, String> result = new HashMap<>();
+    String inClause =
+        values.stream()
+            .map(this::escapeSoqlStringLiteral)
+            .collect(Collectors.joining(",", "(", ")"));
+    String soql =
+        String.format(
+            "SELECT Id,%s FROM %s WHERE %s IN %s",
+            externalIdField, object, externalIdField, inClause);
+
+    String nextUrl = null;
+    do {
+      HttpRequest.Builder request =
+          nextUrl == null
+              ? HttpRequest.newBuilder(
+                      getUriFrom(
+                          config.getSalesforceUri() + simpleQueryUri,
+                          "q=" + URLEncoder.encode(soql, StandardCharsets.UTF_8),
+                          config.getSalesforceApiVersion()))
+                  .GET()
+              : HttpRequest.newBuilder(URI.create(config.getSalesforceUri() + nextUrl)).GET();
+
+      ExecutionResult executionResult = executeHttpRequest(request).join();
+      if (executionResult.hasException() || !executionResult.isSuccess()) {
+        LOGGER.error("Failed to resolve external Id records: {}", executionResult.getMessage());
+        return Optional.empty();
+      }
+      try {
+        JsonNode root = mapper.readTree(executionResult.response().body());
+        for (JsonNode record : root.path("records")) {
+          String extValue = record.path(externalIdField).asText(null);
+          String id = record.path("Id").asText(null);
+          if (extValue != null && id != null) {
+            result.put(extValue, id);
+          }
+        }
+        nextUrl =
+            root.path("done").asBoolean(true) ? null : root.path("nextRecordsUrl").asText(null);
+      } catch (JsonProcessingException e) {
+        LOGGER.error("Unable to parse external Id query response: {}", e.getMessage(), e);
+        return Optional.empty();
+      }
+    } while (nextUrl != null);
+
+    return Optional.of(result);
+  }
+
+  /**
+   * Escapes a value for use as a single-quoted SOQL string literal (backslash and single quote).
+   *
+   * @param value the raw value
+   * @return the value, escaped and wrapped in single quotes
+   */
+  private String escapeSoqlStringLiteral(String value) {
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'";
+  }
+
+  /**
    * Submits a Bulk API 2.0 ingest job as a multipart/form-data POST request.
    *
    * <p>The multipart body contains a JSON job definition part and a CSV content part, where the
@@ -226,25 +355,40 @@ public class BulkApiClient {
    * @param object the Salesforce object to insert into (such as Accounts or Contacts)
    * @param columns the CSV column names used for the header row
    * @param data stream of CSV records, in the same order as {@code columns}
+   * @param operation the Bulk API 2.0 ingest operation to use ({@link #INSERT_OPERATION}, {@link
+   *     #UPSERT_OPERATION}, or {@link #DELETE_OPERATION})
+   * @param externalIdFieldName the Salesforce external ID field API name used to match existing
+   *     records; required (and only used) when {@code operation} is {@link #UPSERT_OPERATION},
+   *     ignored otherwise
    * @return the parsed {@link QueryResponse} when the request succeeds, or {@link Optional#empty()}
    *     if submission fails
    */
   public Optional<QueryResponse> multipartInsert(
-      String object, Object[] columns, Stream<Object[]> data) {
+      String object,
+      Object[] columns,
+      Stream<Object[]> data,
+      String operation,
+      String externalIdFieldName) {
     Objects.requireNonNull(object, "object");
+    Objects.requireNonNull(operation, "operation");
 
     // The boundary is a unique string that separates the job setup and data to ingest
     var boundary = UUID.randomUUID().toString();
 
     // The preamble contains the job setup part, and starts the data part, including the CSV header
-    String jobSetup =
+    var jobSetupNode =
         MAPPER
             .createObjectNode()
             .put("object", object)
             .put("contentType", "CSV")
-            .put("operation", "insert")
-            .put("lineEnding", "LF")
-            .toString();
+            .put("operation", operation)
+            .put("lineEnding", "LF");
+    if (UPSERT_OPERATION.equals(operation)
+        && externalIdFieldName != null
+        && !externalIdFieldName.isBlank()) {
+      jobSetupNode.put("externalIdFieldName", externalIdFieldName);
+    }
+    String jobSetup = jobSetupNode.toString();
     final String preamble =
         String.format(
             """
