@@ -39,6 +39,27 @@ offset.flush.timeout.ms=5000
 # The maximum number of times to retry an insert or authentication request against the Bulk API before failing
 max.retries=3
 
+# The destination Salesforce object type to write records to (required, no default)
+salesforce.bulk.api.sink.object=Account
+
+# Required (no default), but unused by the sink connector; it only applies to the source connector.
+# Any non-empty value works here.
+topic.prefix=unused
+
+# The Bulk API 2.0 operation this connector instance performs: insert (default), upsert, or delete.
+# This is fixed for the whole connector instance; run separate connector instances/topics if you need more than one.
+salesforce.bulk.api.sink.operation=insert
+
+# Required only when salesforce.bulk.api.sink.operation=upsert: the Salesforce External ID field API name
+# used to match existing records (e.g. ExternalId__c). Using upsert avoids creating duplicate records on retry.
+# salesforce.bulk.api.sink.external.id.field=ExternalId__c
+
+# Optional: to mix operations (e.g. insert and delete) within the same topic/connector instance, set this
+# to a field name in each record's value carrying "insert", "upsert", or "delete" per record. That field is
+# stripped before the record is sent to Salesforce; records without it (or blank) fall back to
+# salesforce.bulk.api.sink.operation above.
+# salesforce.bulk.api.sink.record.operation.field=_operation
+
 # The version of the Salesforce API to use for all queries
 salesforce.api.version=v65.0
 

@@ -22,8 +22,8 @@ Salesforce Sink Connector for Apache Kafka
 Overview
 ------------------------------------------------------------------------------
 
-The Aiven Kafka Sink Connector for Salesforce takes messages published to Kafka topics and inserts them to Salesforce objects.
-It provides an *at least once* delivery guarantee. This means that duplicate records can be sent to Salesforce, particularly around restarts or failures.
+The Aiven Kafka Sink Connector for Salesforce takes messages published to Kafka topics and writes them to Salesforce objects using the Bulk API 2.0 `insert`, `upsert`, or `delete` operations (configured per connector instance via `salesforce.bulk.api.sink.operation`).
+It provides an *at least once* delivery guarantee. This means that duplicate records can be sent to Salesforce, particularly around restarts or failures; using `upsert` with a Salesforce external ID field (`salesforce.bulk.api.sink.external.id.field`) avoids creating duplicate records when this happens, since re-sent records simply overwrite the previous attempt instead of inserting a new row.
 
 Configuration
 ------------------------------------------------------------------------------
@@ -77,9 +77,13 @@ Visit our release page for [release information](https://github.com/Aiven-Open/s
 Current Limitations
 ==============================================================================
 
-- **Insert only**: Currently only supports `insert` operations. Update and upsert operations are not yet implemented
+- **Operation is fixed per connector instance, unless overridden per record**: `salesforce.bulk.api.sink.operation` applies to every record processed by a task. To mix operations (e.g. insert and delete) within the same topic/connector instance, set `salesforce.bulk.api.sink.record.operation.field` to the name of a field in each record's value carrying `insert`, `upsert`, or `delete`; that field is stripped before the record is sent to Salesforce, records without it (or with a blank value) fall back to `salesforce.bulk.api.sink.operation`, and records with an unrecognized value (or `upsert` without `salesforce.bulk.api.sink.external.id.field` configured) are skipped and reported instead of failing the batch.
+- **Delete is a soft delete**: `delete` moves records to the Salesforce Recycle Bin (Bulk API 2.0 `delete` operation); it does not permanently remove them (`hardDelete` is not exposed by this connector). By default, deleted records are matched by the Salesforce record `Id` field on the Kafka record; any other fields present are ignored. If `salesforce.bulk.api.sink.external.id.field` is configured, delete records instead carry that external ID field (the same one used for upsert), and the connector resolves it to the Salesforce record Id via a SOQL query before deleting — so producers never need to know Salesforce-generated Ids. An external ID with no matching Salesforce record is skipped and reported rather than failing the batch.
+- **Upsert requires an external ID field**: `upsert` requires `salesforce.bulk.api.sink.external.id.field` to be set to an External ID field API name (e.g. `ExternalId__c`) configured on the target Salesforce object; the connector does not validate that the field actually exists or is marked as an External ID in Salesforce, only that a value was supplied.
 - **Dynamic schema**: Field names are discovered dynamically from records. This provides flexibility but may lead to schema inconsistencies
 - **Batch processing**: All records in a flush are sent as a single batch. Large batches may hit Salesforce API limits
+- **Retries rely on Kafka Connect, not internal buffering**: when a flush fails (a Salesforce job fails, or an external ID lookup fails), the connector doesn't keep those records around itself for a future retry — it lets the exception propagate. Kafka Connect then leaves the offsets uncommitted and redelivers the same records once the consumer seeks back, which is what actually retries them. As with any at-least-once sink, a failure after Salesforce has accepted a job (but before Kafka Connect commits the offset) can result in the same records being sent again on retry.
+- **Partial-row failures are not surfaced per record**: the connector waits for the Salesforce job to reach a terminal state and only fails the batch if the job itself fails or aborts; a job that completes with some rows rejected (`numberRecordsFailed` > 0) is currently still treated as a success at the connector level.
 
 License
 ==============================================================================

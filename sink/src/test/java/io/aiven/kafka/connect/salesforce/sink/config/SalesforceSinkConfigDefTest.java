@@ -39,7 +39,9 @@ public class SalesforceSinkConfigDefTest {
     for (ExtendedConfigKeyBean bean :
         new ConfigDefBeanFactory().open(SalesforceSinkConfigDef.class.getName()).configKeys()) {
       if (!defaultConfigs.containsKey(bean.getName())) {
-        assertThat(bean.since()).as(bean.getName()).containsAnyOf("0.2.0", "Kafka 0.9.0.0");
+        assertThat(bean.since())
+            .as(bean.getName())
+            .containsAnyOf("0.2.0", "0.5.0", "Kafka 0.9.0.0");
       }
     }
   }
